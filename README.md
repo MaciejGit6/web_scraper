@@ -5,4 +5,4 @@ ale które będą później ze sobą współpracować
 
 Druga kwestia: nie wiem czy to snobizm ale chętnie pisałbym wszystko tutaj po angielsku, 
 Co sądzisz?
-
+Sure możemy zrobić wszystko po angielsku
