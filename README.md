@@ -6,3 +6,6 @@ ale które będą później ze sobą współpracować
 Druga kwestia: nie wiem czy to snobizm ale chętnie pisałbym wszystko tutaj po angielsku, 
 Co sądzisz?
 Sure możemy zrobić wszystko po angielsku
+
+I ll write basic child processes as a separate
+function which can be invoked during fork in parent.
