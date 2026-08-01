@@ -9,3 +9,4 @@ Sure możemy zrobić wszystko po angielsku
 
 I ll write basic child processes as a separate
 function which can be invoked during fork in parent.
+the idea is makes no sesne in Rust. we will need to use multithreading.
