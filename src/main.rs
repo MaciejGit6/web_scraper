@@ -13,6 +13,10 @@ use std::{
     ptr,
 };
 
+//files with utilities:
+use crate::error::{ pthread_error, invalid_input, invalid_data};
+mod error;
+
 const STATE_MAGIC: u64 = 0x444F_4D41_494E_4D4D; 
 const STATE_VERSION: u32 = 1;
 const SEMAPHORE_SLOTS: u32 = 4;
@@ -637,18 +641,8 @@ fn print_usage(program: &OsString) {
     );
 }
 
-fn pthread_error(operation: &str, code: libc::c_int) -> io::Error {
-    let error = io::Error::from_raw_os_error(code);
-    io::Error::new(error.kind(), format!("{operation} failed: {error}"))
-}
 
-fn invalid_data(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.into())
-}
 
-fn invalid_input(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, message.into())
-}
 
 fn run() -> io::Result<()> {
     let arguments = parse_arguments()?;
