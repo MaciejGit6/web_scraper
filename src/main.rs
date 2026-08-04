@@ -11,11 +11,15 @@ use std::{
     ptr,
 };
 
+mod error;
+mod cli;
+mod sync;
+
 //files with utilities:
 use crate::error::{ pthread_error, invalid_input, invalid_data};
 use crate::cli::parse_arguments;
-mod error;
-mod cli;
+use crate::sync::{FileLock, MutexGuard, SemaphoreGuard};
+
 
 const STATE_MAGIC: u64 = 0x444F_4D41_494E_4D4D; 
 const STATE_VERSION: u32 = 1;
@@ -78,17 +82,7 @@ pub struct SharedCoordinator {
     path: PathBuf,
 }
 
-struct FileLock<'a> {
-    file: &'a File,
-}
 
-struct SemaphoreGuard {
-    semaphore: *mut libc::sem_t,
-}
-
-struct MutexGuard {
-    mutex: *mut libc::pthread_mutex_t,
-}
 
 impl DomainFile {
     pub fn open(path: &Path) -> io::Result<Self> {
@@ -220,8 +214,7 @@ impl SharedCoordinator {
         operation: impl FnOnce(&mut Self) -> io::Result<T>,
     ) -> io::Result<T> {
         let semaphore = self.semaphore_ptr();
-        sem_wait_retry(semaphore)?;
-        let _guard = SemaphoreGuard { semaphore };
+        let _guard = unsafe { SemaphoreGuard::acquire(semaphore)? };
         operation(self)
     }
 
@@ -318,24 +311,7 @@ impl SharedCoordinator {
 
     fn lock_state(&mut self) -> io::Result<MutexGuard> {
         let mutex = self.mutex_ptr();
-        let rc = unsafe { libc::pthread_mutex_lock(mutex) };
-
-        if rc == libc::EOWNERDEAD {
-            let consistent_rc = unsafe { libc::pthread_mutex_consistent(mutex) };
-            if consistent_rc != 0 {
-                unsafe {
-                    libc::pthread_mutex_unlock(mutex);
-                }
-                return Err(pthread_error(
-                    "pthread_mutex_consistent",
-                    consistent_rc,
-                ));
-            }
-        } else if rc != 0 {
-            return Err(pthread_error("pthread_mutex_lock", rc));
-        }
-
-        Ok(MutexGuard { mutex })
+        unsafe { MutexGuard::lock(mutex) }
     }
 
     fn header_ptr_const(&self) -> *const SharedStateHeader {
@@ -416,39 +392,7 @@ impl SharedCoordinator {
     }
 }
 
-impl<'a> FileLock<'a> {
-    fn exclusive(file: &'a File) -> io::Result<Self> {
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(FileLock { file })
-    }
-}
 
-impl Drop for FileLock<'_> {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
-
-impl Drop for SemaphoreGuard {
-    fn drop(&mut self) {
-        unsafe {
-            libc::sem_post(self.semaphore);
-        }
-    }
-}
-
-impl Drop for MutexGuard {
-    fn drop(&mut self) {
-        unsafe {
-            libc::pthread_mutex_unlock(self.mutex);
-        }
-    }
-}
 
 fn initialize_state_file(file: &File, input: InputIdentity) -> io::Result<()> {
     file.set_len(size_of::<SharedStateHeader>() as u64)?;
