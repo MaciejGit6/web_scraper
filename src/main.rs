@@ -1,12 +1,11 @@
 #![cfg(target_os = "linux")]
 
-use memmap2::{Mmap, MmapMut};
+use memmap2::{ MmapMut};
 use std::{
-    fs::{File, Metadata, OpenOptions},
+    fs::{File, OpenOptions},
     io,
     mem::{size_of, MaybeUninit},
-    ops::Range,
-    os::{fd::AsRawFd, unix::fs::MetadataExt},
+    os::{fd::AsRawFd},
     path::{Path, PathBuf},
     ptr,
 };
@@ -14,45 +13,18 @@ use std::{
 mod error;
 mod cli;
 mod sync;
+mod input;
 
 //files with utilities:
 use crate::error::{ pthread_error, invalid_input, invalid_data};
 use crate::cli::parse_arguments;
 use crate::sync::{FileLock, MutexGuard, SemaphoreGuard};
+use crate::input::{DomainClaim, DomainFile, InputIdentity, OptionsFile};
 
 
 const STATE_MAGIC: u64 = 0x444F_4D41_494E_4D4D; 
 const STATE_VERSION: u32 = 1;
 const SEMAPHORE_SLOTS: u32 = 4;
-
-pub struct DomainFile {
-    path: PathBuf,
-    mmap: Mmap,
-    identity: InputIdentity,
-}
-
-
-pub struct OptionsFile {
-    path: PathBuf,
-    mmap: Option<Mmap>,
-    len: usize,
-}
-
-
-#[derive(Debug, Clone)]
-pub struct DomainClaim {
-    pub number: u64,
-    pub range: Range<usize>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct InputIdentity {
-    device: u64,
-    inode: u64,
-    size: u64,
-    modified_seconds: i64,
-    modified_nanoseconds: i64,
-}
 
 
 #[repr(C)]
@@ -83,97 +55,6 @@ pub struct SharedCoordinator {
 }
 
 
-
-impl DomainFile {
-    pub fn open(path: &Path) -> io::Result<Self> {
-        let file = File::open(path)?;
-        let metadata = file.metadata()?;
-
-        if metadata.len() == 0 {
-            return Err(invalid_input("the domain input file is empty"));
-        }
-
-        let mmap = unsafe { Mmap::map(&file)? };
-        let identity = InputIdentity::from_metadata(&metadata);
-
-        Ok(Self {
-            path: path.to_path_buf(),
-            mmap,
-            identity,
-        })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn len(&self) -> usize {
-        self.mmap.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.mmap.is_empty()
-    }
-
-    pub fn bytes(&self) -> &[u8] {
-        &self.mmap
-    }
-
-
-    pub fn domain_bytes(&self, claim: &DomainClaim) -> &[u8] {
-        &self.mmap[claim.range.clone()]
-    }
-}
-
-impl OptionsFile {
-    pub fn open(path: &Path) -> io::Result<Self> {
-        let file = File::open(path)?;
-        let len = usize::try_from(file.metadata()?.len())
-            .map_err(|_| invalid_input("options file is too large for this platform"))?;
-
-      
-        let mmap = if len == 0 {
-            None
-        } else {
-            Some(unsafe { Mmap::map(&file)? })
-        };
-
-        Ok(Self {
-            path: path.to_path_buf(),
-            mmap,
-            len,
-        })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn bytes(&self) -> &[u8] {
-        self.mmap.as_deref().unwrap_or(&[])
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-impl InputIdentity {
-    fn from_metadata(metadata: &Metadata) -> Self {
-        Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            size: metadata.len(),
-            modified_seconds: metadata.mtime(),
-            modified_nanoseconds: metadata.mtime_nsec(),
-        }
-    }
-}
-
 impl SharedCoordinator {
 
     pub fn open_or_create(path: &Path, input: &DomainFile) -> io::Result<Self> {
@@ -187,7 +68,7 @@ impl SharedCoordinator {
         let _initialization_lock = FileLock::exclusive(&file)?;
 
         if file.metadata()?.len() == 0 {
-            initialize_state_file(&file, input.identity)?;
+            initialize_state_file(&file, input.identity())?;
         }
 
         if file.metadata()?.len() != size_of::<SharedStateHeader>() as u64 {
@@ -201,7 +82,7 @@ impl SharedCoordinator {
             mmap,
             path: path.to_path_buf(),
         };
-        coordinator.validate(input.identity)?;
+        coordinator.validate(input.identity())?;
         Ok(coordinator)
     }
 
@@ -506,9 +387,6 @@ fn sem_wait_retry(semaphore: *mut libc::sem_t) -> io::Result<()> {
         }
     }
 }
-
-
-
 
 
 
