@@ -1,0 +1,377 @@
+use crate::error::{invalid_data, pthread_error};
+use crate::input::{DomainClaim, DomainFile, InputIdentity};
+use crate::sync::{FileLock, MutexGuard, SemaphoreGuard};
+use memmap2::MmapMut;
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::mem::{size_of, MaybeUninit};
+use std::path::{Path, PathBuf};
+use std::ptr;
+
+
+
+const STATE_MAGIC: u64 = 0x444F_4D41_494E_4D4D; 
+const STATE_VERSION: u32 = 1;
+const SEMAPHORE_SLOTS: u32 = 4;
+
+
+#[repr(C)]
+pub struct SharedStateHeader {
+    magic: u64,
+    version: u32,
+    header_size: u32,
+
+    input_device: u64,
+    input_inode: u64,
+    input_size: u64,
+    input_modified_seconds: i64,
+    input_modified_nanoseconds: i64,
+
+    next_offset: u64,
+    claimed_domains: u64,
+    semaphore_slots: u32,
+    _reserved: u32,
+
+    mutex: libc::pthread_mutex_t,
+    semaphore: libc::sem_t,
+}
+
+
+pub struct SharedCoordinator {
+    mmap: MmapMut,
+    path: PathBuf,
+}
+
+
+impl SharedCoordinator {
+
+    pub fn open_or_create(path: &Path, input: &DomainFile) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
+
+        // Prevent two processes from initializing pthread objects at once.
+        let _initialization_lock = FileLock::exclusive(&file)?;
+
+        if file.metadata()?.len() == 0 {
+            initialize_state_file(&file, input.identity())?;
+        }
+
+        if file.metadata()?.len() != size_of::<SharedStateHeader>() as u64 {
+            return Err(invalid_data(
+                "the state file has the wrong size; delete it and start again",
+            ));
+        }
+
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
+        let coordinator = Self {
+            mmap,
+            path: path.to_path_buf(),
+        };
+        coordinator.validate(input.identity())?;
+        Ok(coordinator)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn with_worker_slot<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let semaphore = self.semaphore_ptr();
+        let _guard = unsafe { SemaphoreGuard::acquire(semaphore)? };
+        operation(self)
+    }
+
+  
+    pub fn claim_next_domain(&mut self, input: &DomainFile) -> io::Result<Option<DomainClaim>> {
+        let _guard = self.lock_state()?;
+        let header = self.header_ptr_mut();
+        let bytes = input.bytes();
+
+        let mut offset = usize::try_from(unsafe {
+            ptr::read(ptr::addr_of!((*header).next_offset))
+        })
+        .map_err(|_| invalid_data("next_offset does not fit usize"))?;
+
+        if offset > bytes.len() {
+            return Err(invalid_data("next_offset is beyond the input mmap"));
+        }
+
+        loop {
+          
+            while offset < bytes.len()
+                && matches!(bytes[offset], b'\n' | b'\r' | b' ' | b'\t')
+            {
+                offset += 1;
+            }
+
+            if offset >= bytes.len() {
+                unsafe {
+                    ptr::write(ptr::addr_of_mut!((*header).next_offset), bytes.len() as u64);
+                }
+                return Ok(None);
+            }
+
+            let mut line_end = offset;
+            while line_end < bytes.len() && bytes[line_end] != b'\n' {
+                line_end += 1;
+            }
+
+            let next_offset = if line_end < bytes.len() {
+                line_end + 1
+            } else {
+                line_end
+            };
+
+            let mut trimmed_end = line_end;
+            while trimmed_end > offset
+                && matches!(bytes[trimmed_end - 1], b'\r' | b' ' | b'\t')
+            {
+                trimmed_end -= 1;
+            }
+
+            unsafe {
+                ptr::write(
+                    ptr::addr_of_mut!((*header).next_offset),
+                    next_offset as u64,
+                );
+            }
+
+            if trimmed_end == offset {
+                offset = next_offset;
+                continue;
+            }
+
+            let number = unsafe {
+                let current = ptr::read(ptr::addr_of!((*header).claimed_domains));
+                let next = current
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("claimed domain counter overflow"))?;
+                ptr::write(ptr::addr_of_mut!((*header).claimed_domains), next);
+                next
+            };
+
+            return Ok(Some(DomainClaim {
+                number,
+                range: offset..trimmed_end,
+            }));
+        }
+    }
+
+    /// Current shared cursor, useful later for diagnostics or progress reports.
+    pub fn progress(&mut self) -> io::Result<(u64, u64)> {
+        let _guard = self.lock_state()?;
+        let header = self.header_ptr_const();
+        let next_offset = unsafe { ptr::read(ptr::addr_of!((*header).next_offset)) };
+        let claimed_domains = unsafe { ptr::read(ptr::addr_of!((*header).claimed_domains)) };
+        Ok((next_offset, claimed_domains))
+    }
+
+    /// Persists the sidecar state to disk. Shared-memory visibility between
+    /// processes does not require a flush, but persistence across a crash may.
+    pub fn flush(&self) -> io::Result<()> {
+        self.mmap.flush()
+    }
+
+    fn lock_state(&mut self) -> io::Result<MutexGuard> {
+        let mutex = self.mutex_ptr();
+        unsafe { MutexGuard::lock(mutex) }
+    }
+
+    fn header_ptr_const(&self) -> *const SharedStateHeader {
+        self.mmap.as_ptr().cast::<SharedStateHeader>()
+    }
+
+    fn header_ptr_mut(&mut self) -> *mut SharedStateHeader {
+        self.mmap.as_mut_ptr().cast::<SharedStateHeader>()
+    }
+
+    fn mutex_ptr(&mut self) -> *mut libc::pthread_mutex_t {
+        let header = self.header_ptr_mut();
+        unsafe { ptr::addr_of_mut!((*header).mutex) }
+    }
+
+    fn semaphore_ptr(&mut self) -> *mut libc::sem_t {
+        let header = self.header_ptr_mut();
+        unsafe { ptr::addr_of_mut!((*header).semaphore) }
+    }
+
+    fn validate(&self, input: InputIdentity) -> io::Result<()> {
+        let header = self.header_ptr_const();
+        let (
+            magic,
+            version,
+            header_size,
+            input_device,
+            input_inode,
+            input_size,
+            modified_seconds,
+            modified_nanoseconds,
+            next_offset,
+        ) = unsafe {
+            (
+                ptr::read(ptr::addr_of!((*header).magic)),
+                ptr::read(ptr::addr_of!((*header).version)),
+                ptr::read(ptr::addr_of!((*header).header_size)),
+                ptr::read(ptr::addr_of!((*header).input_device)),
+                ptr::read(ptr::addr_of!((*header).input_inode)),
+                ptr::read(ptr::addr_of!((*header).input_size)),
+                ptr::read(ptr::addr_of!((*header).input_modified_seconds)),
+                ptr::read(ptr::addr_of!((*header).input_modified_nanoseconds)),
+                ptr::read(ptr::addr_of!((*header).next_offset)),
+            )
+        };
+
+        if magic != STATE_MAGIC {
+            return Err(invalid_data(
+                "the state file is not initialized or belongs to another program",
+            ));
+        }
+        if version != STATE_VERSION {
+            return Err(invalid_data("unsupported state-file version"));
+        }
+        if header_size as usize != size_of::<SharedStateHeader>() {
+            return Err(invalid_data(
+                "SharedStateHeader size does not match this build",
+            ));
+        }
+
+        let same_input = input_device == input.device
+            && input_inode == input.inode
+            && input_size == input.size
+            && modified_seconds == input.modified_seconds
+            && modified_nanoseconds == input.modified_nanoseconds;
+
+        if !same_input {
+            return Err(invalid_data(
+                "the state file belongs to a different or modified input file; delete the state file",
+            ));
+        }
+
+        if next_offset > input.size {
+            return Err(invalid_data("state cursor is beyond the input file"));
+        }
+
+        Ok(())
+    }
+}
+
+
+
+pub fn initialize_state_file(file: &File, input: InputIdentity) -> io::Result<()> {
+    file.set_len(size_of::<SharedStateHeader>() as u64)?;
+
+    let mut mmap = unsafe { MmapMut::map_mut(file)? };
+    mmap.fill(0);
+
+    let header = mmap.as_mut_ptr().cast::<SharedStateHeader>();
+    let mutex = unsafe { ptr::addr_of_mut!((*header).mutex) };
+    let semaphore = unsafe { ptr::addr_of_mut!((*header).semaphore) };
+
+    let mut attributes = MaybeUninit::<libc::pthread_mutexattr_t>::uninit();
+    let rc = unsafe { libc::pthread_mutexattr_init(attributes.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(pthread_error("pthread_mutexattr_init", rc));
+    }
+    let mut attributes = unsafe { attributes.assume_init() };
+
+    let initialization_result = (|| -> io::Result<()> {
+        let rc = unsafe {
+            libc::pthread_mutexattr_setpshared(
+                &mut attributes,
+                libc::PTHREAD_PROCESS_SHARED,
+            )
+        };
+        if rc != 0 {
+            return Err(pthread_error("pthread_mutexattr_setpshared", rc));
+        }
+
+        let rc = unsafe {
+            libc::pthread_mutexattr_setrobust(&mut attributes, libc::PTHREAD_MUTEX_ROBUST)
+        };
+        if rc != 0 {
+            return Err(pthread_error("pthread_mutexattr_setrobust", rc));
+        }
+
+        let rc = unsafe { libc::pthread_mutex_init(mutex, &attributes) };
+        if rc != 0 {
+            return Err(pthread_error("pthread_mutex_init", rc));
+        }
+
+        if unsafe { libc::sem_init(semaphore, 1, SEMAPHORE_SLOTS) } != 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::pthread_mutex_destroy(mutex);
+            }
+            return Err(io::Error::new(
+                error.kind(),
+                format!("sem_init failed: {error}"),
+            ));
+        }
+
+        unsafe {
+            ptr::write(
+                ptr::addr_of_mut!((*header).version),
+                STATE_VERSION,
+            );
+            ptr::write(
+                ptr::addr_of_mut!((*header).header_size),
+                size_of::<SharedStateHeader>() as u32,
+            );
+            ptr::write(
+                ptr::addr_of_mut!((*header).input_device),
+                input.device,
+            );
+            ptr::write(ptr::addr_of_mut!((*header).input_inode), input.inode);
+            ptr::write(ptr::addr_of_mut!((*header).input_size), input.size);
+            ptr::write(
+                ptr::addr_of_mut!((*header).input_modified_seconds),
+                input.modified_seconds,
+            );
+            ptr::write(
+                ptr::addr_of_mut!((*header).input_modified_nanoseconds),
+                input.modified_nanoseconds,
+            );
+            ptr::write(ptr::addr_of_mut!((*header).next_offset), 0);
+            ptr::write(ptr::addr_of_mut!((*header).claimed_domains), 0);
+            ptr::write(
+                ptr::addr_of_mut!((*header).semaphore_slots),
+                SEMAPHORE_SLOTS,
+            );
+
+            // Written last so another process never accepts a partial header.
+            ptr::write(ptr::addr_of_mut!((*header).magic), STATE_MAGIC);
+        }
+
+        mmap.flush()?;
+        Ok(())
+    })();
+
+    let destroy_rc = unsafe { libc::pthread_mutexattr_destroy(&mut attributes) };
+    if initialization_result.is_ok() && destroy_rc != 0 {
+        return Err(pthread_error("pthread_mutexattr_destroy", destroy_rc));
+    }
+
+    initialization_result
+}
+
+fn sem_wait_retry(semaphore: *mut libc::sem_t) -> io::Result<()> {
+    loop {
+        if unsafe { libc::sem_wait(semaphore) } == 0 {
+            return Ok(());
+        }
+
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("sem_wait failed: {error}"),
+            ));
+        }
+    }
+}
