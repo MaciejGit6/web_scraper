@@ -5,6 +5,7 @@ mod cli;
 mod sync;
 mod input;
 mod state;
+mod network;
 
 //files with utilities:
 use crate::cli::parse_arguments;
